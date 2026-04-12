@@ -1,5 +1,8 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
+import { auth } from '@/lib/auth';
+import { withAuditUser } from '@/lib/audit';
+import { isPositiveInt } from '@/lib/security';
 
 export async function GET(request: Request) {
     try {
@@ -7,9 +10,15 @@ export async function GET(request: Request) {
         const sessionId = searchParams.get('sessionId');
         const studentId = searchParams.get('studentId');
 
-        const where: any = {};
-        if (sessionId) where.sessionId = Number(sessionId);
-        if (studentId) where.studentId = Number(studentId);
+        const where: Record<string, number> = {};
+        if (sessionId) {
+            if (!isPositiveInt(sessionId)) return NextResponse.json({ error: 'Invalid sessionId' }, { status: 400 });
+            where.sessionId = Number(sessionId);
+        }
+        if (studentId) {
+            if (!isPositiveInt(studentId)) return NextResponse.json({ error: 'Invalid studentId' }, { status: 400 });
+            where.studentId = Number(studentId);
+        }
 
         const assignments = await prisma.studentMessAssignment.findMany({
             where,
@@ -28,31 +37,46 @@ export async function GET(request: Request) {
 
 export async function POST(request: Request) {
     try {
+        const session = await auth();
+        const userId = (session?.user as any)?.id ?? 'unknown';
+
         const { entryNo, messId, sessionId } = await request.json();
         if (!entryNo || !messId || !sessionId) {
             return NextResponse.json({ error: 'entryNo, messId and sessionId are required' }, { status: 400 });
         }
+        if (!isPositiveInt(messId)) return NextResponse.json({ error: 'Invalid messId' }, { status: 400 });
+        if (!isPositiveInt(sessionId)) return NextResponse.json({ error: 'Invalid sessionId' }, { status: 400 });
 
-        const student = await prisma.student.findUnique({ where: { entryNo } });
-        if (!student) return NextResponse.json({ error: `Student ${entryNo} not found` }, { status: 404 });
+        const messIdNum = Number(messId);
+        const sessionIdNum = Number(sessionId);
 
-        const assignment = await prisma.studentMessAssignment.upsert({
-            where: { studentId_sessionId: { studentId: student.id, sessionId: Number(sessionId) } },
-            update: { messId: Number(messId) },
-            create: { studentId: student.id, messId: Number(messId), sessionId: Number(sessionId) },
-            include: { student: true, mess: true, session: true }
+        const result = await withAuditUser(userId, async (tx) => {
+            return tx.$queryRaw<[{ sp_upsert_mess_assignment: number }]>`
+                SELECT sp_upsert_mess_assignment(${entryNo}, ${messIdNum}::int, ${sessionIdNum}::int)
+            `;
         });
-        return NextResponse.json(assignment, { status: 201 });
-    } catch (error) {
+
+        return NextResponse.json({ id: result[0].sp_upsert_mess_assignment, message: 'Mess assignment saved' }, { status: 201 });
+    } catch (error: any) {
         console.error(error);
-        return NextResponse.json({ error: 'Failed to create mess assignment' }, { status: 500 });
+        const msg = error?.message?.includes('Student not found') ? error.message : 'Failed to create mess assignment';
+        return NextResponse.json({ error: msg }, { status: error?.message?.includes('Student not found') ? 404 : 500 });
     }
 }
 
 export async function DELETE(request: Request) {
     try {
+        const session = await auth();
+        const userId = (session?.user as any)?.id ?? 'unknown';
+
         const { id } = await request.json();
-        await prisma.studentMessAssignment.delete({ where: { id: Number(id) } });
+        if (!isPositiveInt(id)) return NextResponse.json({ error: 'Invalid id' }, { status: 400 });
+        const idNum = Number(id);
+
+        await withAuditUser(userId, async (tx) => {
+            return tx.$queryRaw`SELECT sp_delete_mess_assignment(${idNum}::int)`;
+        });
+
         return NextResponse.json({ message: 'Assignment deleted' });
     } catch (error) {
         return NextResponse.json({ error: 'Failed to delete assignment' }, { status: 500 });

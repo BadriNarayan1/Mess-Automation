@@ -1,6 +1,8 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import * as XLSX from 'xlsx';
+import { MAX_UPLOAD_SIZE, isValidExcelFile } from '@/lib/security';
+import { getClientIp, uploadLimiter } from '@/lib/rate-limit';
 
 // POST /api/upload-monthly-rebates
 // Form fields: sessionId, month, year, hostelId ("any" | number), messId ("any" | number)
@@ -9,6 +11,11 @@ import * as XLSX from 'xlsx';
 //   + Hostel (required when hostelId="any")
 export async function POST(request: Request) {
     try {
+        const rateLimitResult = uploadLimiter.check(getClientIp(request));
+        if (!rateLimitResult.allowed) {
+            return NextResponse.json({ error: 'Too many upload requests. Please try again later.' }, { status: 429 });
+        }
+
         const formData = await request.formData();
         const file      = formData.get('file') as File;
         const sessionId = Number(formData.get('sessionId'));
@@ -23,18 +30,12 @@ export async function POST(request: Request) {
         const formHostelId = anyHostel ? null : Number(rawHostelId);
 
         if (!file) return NextResponse.json({ error: 'No file uploaded' }, { status: 400 });
+        if (file.size > MAX_UPLOAD_SIZE) return NextResponse.json({ error: 'File too large. Maximum size is 10MB.' }, { status: 400 });
+        if (!isValidExcelFile(file)) return NextResponse.json({ error: 'Invalid file type. Only Excel files (.xlsx, .xls) are allowed.' }, { status: 400 });
         if (!sessionId || !month || !year)
             return NextResponse.json({ error: 'sessionId, month, and year are required' }, { status: 400 });
         if (month < 1 || month > 12)
             return NextResponse.json({ error: 'month must be between 1 and 12' }, { status: 400 });
-
-        // Fetch mess name map for "any mess" mode
-        const allMesses = await prisma.mess.findMany();
-        const messByName = new Map(allMesses.map(m => [m.name.toLowerCase().trim(), m.id]));
-
-        // Fetch hostel name map for "any hostel" mode
-        const allHostels = await prisma.hostel.findMany();
-        const hostelByName = new Map(allHostels.map(h => [h.name.toLowerCase().trim(), h.id]));
 
         const buffer   = new Uint8Array(await file.arrayBuffer());
         const workbook = XLSX.read(buffer, { type: 'array' });
@@ -44,9 +45,9 @@ export async function POST(request: Request) {
         const errors: string[] = [];
 
         for (const row of jsonData) {
-            const entryNo     = String(row.EntryNo ?? '').trim();
+            const entryNo    = String(row.EntryNo ?? '').trim();
             const rebateDays = Number(row.RebateDays);
-            const messRate   = row.MessRate     != null ? Number(row.MessRate)     : null;
+            const messRate   = row.MessRate != null ? Number(row.MessRate) : null;
             const gstPct     = row.GSTPercentage != null ? Number(row.GSTPercentage) : null;
 
             if (!entryNo || isNaN(rebateDays)) {
@@ -54,100 +55,45 @@ export async function POST(request: Request) {
                 continue;
             }
 
-            const student = await prisma.student.findUnique({
-                where: { entryNo },
-                include: { course: true },
-            });
-            if (!student) { errors.push(`Student not found: ${entryNo}`); continue; }
+            const messName   = anyMess ? String(row.Mess ?? '').trim() : null;
+            const hostelName = anyHostel ? String(row.Hostel ?? '').trim() : null;
 
-            // ── Resolve mess ───────────────────────────────────────────────
-            let resolvedMessId: number | null = formMessId;
-            if (anyMess) {
-                const messName = String(row.Mess ?? '').trim();
-                if (!messName) {
-                    errors.push(`${entryNo}: Mess column missing (required when "Any Mess" selected)`);
-                    continue;
-                }
-                // Upsert mess in case it's new
-                const messRec = await prisma.mess.upsert({
-                    where: { name: messName },
-                    update: {},
-                    create: { name: messName },
-                });
-                resolvedMessId = messRec.id;
+            if (anyMess && !messName) {
+                errors.push(`${entryNo}: Mess column missing (required when "Any Mess" selected)`);
+                continue;
+            }
+            if (anyHostel && !hostelName) {
+                errors.push(`${entryNo}: Hostel column missing (required when "Any Hostel" selected)`);
+                continue;
             }
 
-            // ── Resolve & update hostel ────────────────────────────────────
-            let resolvedHostelId: number | null = formHostelId;
-            if (anyHostel) {
-                const hostelName = String(row.Hostel ?? '').trim();
-                if (!hostelName) {
-                    errors.push(`${entryNo}: Hostel column missing (required when "Any Hostel" selected)`);
-                    continue;
+            try {
+                // Single DB call via stored procedure
+                const result = await prisma.$queryRaw<[{ bulk_upsert_monthly_rebate: string }]>`
+                    SELECT bulk_upsert_monthly_rebate(
+                        ${entryNo}::text,
+                        ${sessionId}::int,
+                        ${month}::int,
+                        ${year}::int,
+                        ${rebateDays}::int,
+                        ${messName ?? null}::text,
+                        ${hostelName ?? null}::text,
+                        ${messRate ?? null}::double precision,
+                        ${gstPct ?? null}::double precision,
+                        ${formMessId ?? null}::int,
+                        ${formHostelId ?? null}::int
+                    )
+                `;
+
+                const msg = result[0]?.bulk_upsert_monthly_rebate;
+                if (msg === 'ok') {
+                    success++;
+                } else {
+                    errors.push(msg ?? `Unknown error for ${entryNo}`);
                 }
-                const hostelRec = await prisma.hostel.upsert({
-                    where: { name: hostelName },
-                    update: {},
-                    create: { name: hostelName },
-                });
-                resolvedHostelId = hostelRec.id;
-                // Update student hostel
-                await prisma.student.update({
-                    where: { id: student.id },
-                    data: { hostelId: hostelRec.id, hostel: hostelName },
-                });
-            } else if (formHostelId) {
-                // Specific hostel selected — update student hostelId if not already set
-                const hostelRec = await prisma.hostel.findUnique({ where: { id: formHostelId } });
-                if (hostelRec) {
-                    await prisma.student.update({
-                        where: { id: student.id },
-                        data: { hostelId: hostelRec.id, hostel: hostelRec.name },
-                    });
-                }
-            }
-
-            // ── Upsert MonthlyRebate ───────────────────────────────────────
-            await prisma.monthlyRebate.upsert({
-                where: { studentId_sessionId_month_year: { studentId: student.id, sessionId, month, year } },
-                update: { rebateDays },
-                create: { studentId: student.id, sessionId, month, year, rebateDays },
-            });
-            success++;
-
-            // ── Upsert StudentMessAssignment ───────────────────────────────
-            if (resolvedMessId) {
-                await prisma.studentMessAssignment.upsert({
-                    where: { studentId_sessionId: { studentId: student.id, sessionId } },
-                    update: { messId: resolvedMessId },
-                    create: { studentId: student.id, messId: resolvedMessId, sessionId },
-                });
-            }
-
-            // ── Upsert MessRate if provided ────────────────────────────────
-            if ((messRate != null || gstPct != null) && resolvedMessId) {
-                await prisma.messRate.upsert({
-                    where: {
-                        messId_sessionId_month: {
-                            messId: resolvedMessId,
-                            sessionId,
-                            month,
-                        },
-                    },
-                    update: {
-                        ...(messRate != null ? { monthlyRate: messRate } : {}),
-                        ...(gstPct   != null ? { gstPercentage: gstPct } : {}),
-                    },
-                    create: {
-                        messId: resolvedMessId,
-                        sessionId,
-                        month,
-                        monthlyRate:   messRate ?? 0,
-                        gstPercentage: gstPct   ?? 0,
-                    },
-                });
-            } else if ((messRate != null || gstPct != null) && !resolvedMessId) {
-                errors.push(`${entryNo}: no mess resolved — MessRate not saved`);
+            } catch (err: any) {
+                console.error(`Error processing ${entryNo}:`, err.message);
+                errors.push(`${entryNo}: ${err.message}`);
             }
         }
 

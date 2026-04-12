@@ -3,34 +3,53 @@ import crypto from "crypto";
 import bcrypt from "bcryptjs";
 import nodemailer from "nodemailer";
 import { prisma } from "@/lib/prisma";
+import { forgotPasswordLimiter } from "@/lib/rate-limit";
+import { isValidEntryNo } from "@/lib/security";
 
 export async function POST(req: Request) {
   try {
-    const { entryNo } = await req.json();
-
-    if (!entryNo) {
+    let body;
+    try {
+      body = await req.json();
+    } catch {
       return NextResponse.json(
-        { error: "Entry number is required" },
+        { error: "Invalid JSON payload" },
         { status: 400 }
       );
     }
+    const { entryNo } = body;
+    const normalizedEntryNo = typeof entryNo === "string" ? entryNo.trim().toUpperCase() : "";
+
+    if (!normalizedEntryNo || !isValidEntryNo(normalizedEntryNo)) {
+      return NextResponse.json(
+        { error: "Valid entry number is required" },
+        { status: 400 }
+      );
+    }
+
+    // Rate limit: 3 attempts per entry number per hour
+    const rateLimitResult = forgotPasswordLimiter.check(normalizedEntryNo);
+    if (!rateLimitResult.allowed) {
+      const retryAfterSecs = Math.ceil(rateLimitResult.retryAfterMs / 1000);
+      return NextResponse.json(
+        { error: `Too many reset requests. Please try again in ${retryAfterSecs} seconds.` },
+        { status: 429 }
+      );
+    }
+
+    // Always return the same success response whether student exists or not
+    // This prevents entry number enumeration attacks
+    const genericResponse = {
+      message: "If this entry number is registered, a reset key has been sent to the registered email address.",
+    };
 
     const student = await prisma.student.findUnique({
-      where: { entryNo },
+      where: { entryNo: normalizedEntryNo },
     });
 
-    if (!student) {
-      return NextResponse.json(
-        { error: "No student found with this entry number" },
-        { status: 404 }
-      );
-    }
-
-    if (!student.email) {
-      return NextResponse.json(
-        { error: "No email address registered for this student. Contact admin." },
-        { status: 400 }
-      );
+    if (!student || !student.email) {
+      // Student doesn't exist or has no email — return same response (no 404 leak)
+      return NextResponse.json(genericResponse);
     }
 
     // Generate random 8-character alphanumeric reset key
@@ -39,7 +58,7 @@ export async function POST(req: Request) {
     const expiry = new Date(Date.now() + 30 * 60 * 1000); // 30 minutes
 
     await prisma.student.update({
-      where: { entryNo },
+      where: { entryNo: normalizedEntryNo },
       data: {
         resetToken: hashedToken,
         resetTokenExp: expiry,
@@ -73,10 +92,7 @@ export async function POST(req: Request) {
       `,
     });
 
-    return NextResponse.json({
-      message: "Reset key sent to your registered email address",
-      email: student.email.replace(/(.{2})(.*)(@.*)/, "$1***$3"), // mask email
-    });
+    return NextResponse.json(genericResponse);
   } catch (error) {
     console.error("Forgot password error:", error);
     return NextResponse.json(

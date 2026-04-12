@@ -185,7 +185,7 @@ export default function MessAssignmentsPage() {
                 title="Bulk Upload via Excel"
                 accent="bg-indigo-500"
                 onUpload={handleBulkUpload}
-                templateUrl="/templates/sample_mess_assignments.xlsx"
+                templateUrl="/api/template?type=mess-assignments"
             />
 
             <Card className="p-0 overflow-hidden">

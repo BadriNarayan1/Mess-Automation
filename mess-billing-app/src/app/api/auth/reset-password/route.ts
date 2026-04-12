@@ -1,11 +1,26 @@
 import { NextResponse } from "next/server";
-import bcrypt from "bcryptjs";
 import { prisma } from "@/lib/prisma";
+import {
+  validatePasswordStrength,
+  verifyPassword,
+  hashPassword,
+  getPasswordRequirements,
+} from "@/lib/password";
 
 export async function POST(req: Request) {
   try {
-    const { entryNo, resetKey, newPassword } = await req.json();
+    let body;
+    try {
+      body = await req.json();
+    } catch {
+      return NextResponse.json(
+        { error: "Invalid JSON payload" },
+        { status: 400 }
+      );
+    }
+    const { entryNo, resetKey, newPassword } = body;
 
+    // Validate input
     if (!entryNo || !resetKey || !newPassword) {
       return NextResponse.json(
         { error: "All fields are required" },
@@ -13,13 +28,20 @@ export async function POST(req: Request) {
       );
     }
 
-    if (newPassword.length < 6) {
+    // Validate password strength
+    const validation = validatePasswordStrength(newPassword);
+    if (!validation.valid) {
       return NextResponse.json(
-        { error: "Password must be at least 6 characters" },
+        {
+          error: "Password does not meet security requirements",
+          details: validation.errors,
+          requirements: getPasswordRequirements(),
+        },
         { status: 400 }
       );
     }
 
+    // Find student by entryNo
     const student = await prisma.student.findUnique({
       where: { entryNo },
     });
@@ -31,7 +53,7 @@ export async function POST(req: Request) {
       );
     }
 
-    // Check expiry
+    // Check token expiry
     if (new Date() > student.resetTokenExp) {
       return NextResponse.json(
         { error: "Reset key has expired. Please request a new one." },
@@ -39,17 +61,19 @@ export async function POST(req: Request) {
       );
     }
 
-    // Verify reset key
-    const isValid = await bcrypt.compare(resetKey, student.resetToken);
-    if (!isValid) {
+    // Verify reset key (constant-time comparison to prevent timing attacks)
+    const isValidToken = await verifyPassword(resetKey, student.resetToken);
+    if (!isValidToken) {
       return NextResponse.json(
         { error: "Invalid reset key" },
         { status: 400 }
       );
     }
 
-    // Hash and save new password, clear reset token
-    const hashedPassword = await bcrypt.hash(newPassword, 10);
+    // Hash new password with 13 rounds (secure)
+    const hashedPassword = await hashPassword(newPassword);
+
+    // Update password and clear reset token
     await prisma.student.update({
       where: { entryNo },
       data: {

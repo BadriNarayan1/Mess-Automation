@@ -7,6 +7,15 @@ const MONTH_NAMES = [
     'July', 'August', 'September', 'October', 'November', 'December'
 ];
 
+const getFilteredMonths = (sessionId: string, sessions: any[]) => {
+    const session = sessions.find(s => String(s.id) === sessionId);
+    const allMonths = MONTH_NAMES.map((name, i) => ({ value: String(i + 1), name }));
+    if (!session) return allMonths;
+    if (session.semester === 'I') return allMonths.filter(m => Number(m.value) >= 7);
+    if (session.semester === 'II') return allMonths.filter(m => Number(m.value) <= 6);
+    return allMonths;
+};
+
 export default function MessRatesPage() {
     const [sessions, setSessions] = useState<any[]>([]);
     const [messes, setMesses] = useState<any[]>([]);
@@ -21,6 +30,18 @@ export default function MessRatesPage() {
         fetch('/api/sessions').then(r => r.json()).then(d => setSessions(Array.isArray(d) ? d : []));
         fetch('/api/messes').then(r => r.json()).then(d => setMesses(Array.isArray(d) ? d : []));
     }, []);
+
+    useEffect(() => {
+        const session = sessions.find(s => String(s.id) === form.sessionId);
+        if (session) {
+            const validMonths = getFilteredMonths(form.sessionId, sessions);
+            let mStr = form.month;
+            if (!validMonths.find(val => val.value === mStr)) {
+                mStr = validMonths[0]?.value || '';
+                setForm(p => ({ ...p, month: mStr }));
+            }
+        }
+    }, [form.sessionId, form.month, sessions]);
 
     const fetchRates = async (sessionId: string) => {
         setFetching(true);
@@ -61,6 +82,17 @@ export default function MessRatesPage() {
         if (selectedSession) fetchRates(selectedSession);
     };
 
+    const handleEdit = (r: any) => {
+        setForm({
+            messId: String(r.messId),
+            sessionId: String(r.sessionId),
+            month: String(r.month),
+            monthlyRate: String(r.monthlyRate),
+            gstPercentage: String(r.gstPercentage || 0)
+        });
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+    };
+
     return (
         <div className="max-w-4xl mx-auto space-y-6 animate-in fade-in duration-500">
             <div>
@@ -87,8 +119,8 @@ export default function MessRatesPage() {
                             <select value={form.month} onChange={e => setForm(p => ({ ...p, month: e.target.value }))} required
                                 className="w-full border border-slate-200 bg-slate-50/50 px-4 py-2.5 rounded-xl font-medium focus:outline-none focus:ring-2 focus:ring-blue-500/50">
                                 <option value="">Select month</option>
-                                {MONTH_NAMES.map((name, i) => (
-                                    <option key={i + 1} value={i + 1}>{name}</option>
+                                {getFilteredMonths(form.sessionId, sessions).map(m => (
+                                    <option key={m.value} value={m.value}>{m.name}</option>
                                 ))}
                             </select>
                         </div>
@@ -162,7 +194,9 @@ export default function MessRatesPage() {
                                     <td className="p-4 text-right">
                                         <span className="inline-flex items-center px-2 py-0.5 rounded-md text-xs font-semibold bg-amber-50 text-amber-700 border border-amber-100">{r.gstPercentage ?? 0}%</span>
                                     </td>
-                                    <td className="p-4 text-right pr-6">
+                                    <td className="p-4 text-right pr-6 flex justify-end gap-2">
+                                        <button onClick={() => handleEdit(r)}
+                                            className="text-blue-600 text-xs font-bold px-3 py-1.5 rounded-lg bg-blue-50 hover:bg-blue-100 transition-colors">Edit</button>
                                         <button onClick={() => handleDelete(r.id)}
                                             className="text-rose-600 text-xs font-bold px-3 py-1.5 rounded-lg bg-rose-50 hover:bg-rose-100 transition-colors">Delete</button>
                                     </td>

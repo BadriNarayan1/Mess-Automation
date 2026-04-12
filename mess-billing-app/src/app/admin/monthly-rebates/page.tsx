@@ -5,6 +5,15 @@ import { Card } from '../../../components/ui/Card';
 const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June',
     'July', 'August', 'September', 'October', 'November', 'December'];
 
+const getFilteredMonths = (sessionId: string, sessions: any[]) => {
+    const session = sessions.find(s => String(s.id) === sessionId);
+    const allMonths = MONTH_NAMES.map((name, i) => ({ value: String(i + 1), name }));
+    if (!session) return allMonths;
+    if (session.semester === 'I') return allMonths.filter(m => Number(m.value) >= 7);
+    if (session.semester === 'II') return allMonths.filter(m => Number(m.value) <= 6);
+    return allMonths;
+};
+
 export default function MonthlyRebatesPage() {
     const [sessions, setSessions] = useState<any[]>([]);
     const [messes, setMesses] = useState<any[]>([]);
@@ -40,6 +49,42 @@ export default function MonthlyRebatesPage() {
         fetch('/api/messes').then(r => r.json()).then(d => setMesses(Array.isArray(d) ? d : []));
         fetch('/api/hostels').then(r => r.json()).then(d => setHostels(Array.isArray(d) ? d : []));
     }, []);
+
+    useEffect(() => {
+        const session = sessions.find(s => String(s.id) === bulkForm.sessionId);
+        if (session) {
+            const validMonths = getFilteredMonths(bulkForm.sessionId, sessions);
+            let mStr = bulkForm.month;
+            if (!validMonths.find(val => val.value === mStr)) {
+                mStr = validMonths[0]?.value || '1';
+                setBulkForm(p => ({ ...p, month: mStr }));
+            }
+            
+            const m = parseInt(mStr);
+            let y = session.startYear;
+            if (session.semester === 'I') y = m >= 7 ? session.startYear : session.startYear + 1;
+            else y = m <= 6 ? session.startYear : session.startYear - 1;
+            setBulkForm(p => ({ ...p, year: String(y) }));
+        }
+    }, [bulkForm.sessionId, bulkForm.month, sessions]);
+
+    useEffect(() => {
+        const session = sessions.find(s => String(s.id) === form.sessionId);
+        if (session) {
+            const validMonths = getFilteredMonths(form.sessionId, sessions);
+            let mStr = form.month;
+            if (!validMonths.find(val => val.value === mStr)) {
+                mStr = validMonths[0]?.value || '1';
+                setForm(p => ({ ...p, month: mStr }));
+            }
+
+            const m = parseInt(mStr);
+            let y = session.startYear;
+            if (session.semester === 'I') y = m >= 7 ? session.startYear : session.startYear + 1;
+            else y = m <= 6 ? session.startYear : session.startYear - 1;
+            setForm(p => ({ ...p, year: String(y) }));
+        }
+    }, [form.sessionId, form.month, sessions]);
 
     const onHostelChange = useCallback((hostelId: string) => {
         setBulkForm(p => ({ ...p, hostelId }));
@@ -186,15 +231,15 @@ export default function MonthlyRebatesPage() {
                                 <label className="block text-xs font-bold text-slate-600 mb-1.5 uppercase tracking-wide">Month</label>
                                 <select value={bulkForm.month} onChange={e => setBulkForm(p => ({ ...p, month: e.target.value }))} required
                                     className="w-full border border-slate-200 bg-white px-4 py-2.5 rounded-xl font-medium focus:outline-none focus:ring-2 focus:ring-indigo-500/50">
-                                    {MONTH_NAMES.map((m, i) => <option key={i + 1} value={i + 1}>{m}</option>)}
+                                    {getFilteredMonths(bulkForm.sessionId, sessions).map(m => <option key={m.value} value={m.value}>{m.name}</option>)}
                                 </select>
                             </div>
 
                             {/* Year */}
                             <div>
-                                <label className="block text-xs font-bold text-slate-600 mb-1.5 uppercase tracking-wide">Year</label>
-                                <input type="number" value={bulkForm.year} onChange={e => setBulkForm(p => ({ ...p, year: e.target.value }))} required min="2000" max="2100"
-                                    className="w-full border border-slate-200 bg-white px-4 py-2.5 rounded-xl font-medium focus:outline-none focus:ring-2 focus:ring-indigo-500/50" />
+                                <label className="block text-xs font-bold text-slate-600 mb-1.5 uppercase tracking-wide">Year (Auto)</label>
+                                <input type="text" value={bulkForm.year} readOnly
+                                    className="w-full border border-slate-200 bg-slate-100 cursor-not-allowed text-slate-500 px-4 py-2.5 rounded-xl font-medium focus:outline-none" />
                             </div>
 
                             {/* File */}
@@ -225,7 +270,14 @@ export default function MonthlyRebatesPage() {
                             </button>
                             <button
                                 type="button"
-                                onClick={() => window.open('/templates/sample_monthly_rebates.xlsx', '_blank')}
+                                onClick={() => {
+                                    const anyMess = bulkForm.messId === 'any' || !bulkForm.messId;
+                                    const anyHostel = bulkForm.hostelId === 'any' || !bulkForm.hostelId;
+                                    let type = 'monthly-rebates-base';
+                                    if (anyMess && anyHostel) type = 'monthly-rebates-mess-hostel';
+                                    else if (anyMess) type = 'monthly-rebates-mess';
+                                    window.open(`/api/template?type=${type}`, '_blank');
+                                }}
                                 className="flex items-center gap-2 bg-slate-100 text-slate-700 font-bold px-4 py-2.5 rounded-xl hover:bg-slate-200 transition-colors text-sm"
                             >
                                 <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg>
@@ -275,13 +327,13 @@ export default function MonthlyRebatesPage() {
                             <label className="block text-xs font-bold text-slate-600 mb-1.5 uppercase tracking-wide">Month</label>
                             <select value={form.month} onChange={e => setForm(p => ({ ...p, month: e.target.value }))} required
                                 className="w-full border border-slate-200 bg-slate-50/50 px-4 py-2.5 rounded-xl font-medium focus:outline-none focus:ring-2 focus:ring-orange-500/50">
-                                {MONTH_NAMES.map((m, i) => <option key={i + 1} value={i + 1}>{m}</option>)}
+                                {getFilteredMonths(form.sessionId, sessions).map(m => <option key={m.value} value={m.value}>{m.name}</option>)}
                             </select>
                         </div>
                         <div>
-                            <label className="block text-xs font-bold text-slate-600 mb-1.5 uppercase tracking-wide">Year</label>
-                            <input type="number" value={form.year} onChange={e => setForm(p => ({ ...p, year: e.target.value }))} required
-                                className="w-full border border-slate-200 bg-slate-50/50 px-4 py-2.5 rounded-xl font-medium focus:outline-none focus:ring-2 focus:ring-orange-500/50" min="2000" max="2100" />
+                            <label className="block text-xs font-bold text-slate-600 mb-1.5 uppercase tracking-wide">Year (Auto)</label>
+                            <input type="text" value={form.year} readOnly
+                                className="w-full border border-slate-200 bg-slate-100/50 cursor-not-allowed text-slate-500 px-4 py-2.5 rounded-xl font-medium focus:outline-none" />
                         </div>
                         <div>
                             <label className="block text-xs font-bold text-slate-600 mb-1.5 uppercase tracking-wide">Rebate Days</label>

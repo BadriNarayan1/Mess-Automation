@@ -166,3 +166,19 @@ model StudentLeft {
 
   @@unique([studentId, sessionId])
 }
+
+model AuditLog {
+  id         Int      @id @default(autoincrement())
+  tableName  String   @map("table_name")
+  operation  String
+  recordId   Int?     @map("record_id")
+  oldData    Json?    @map("old_data")
+  newData    Json?    @map("new_data")
+  changedBy  String?  @map("changed_by")
+  changedAt  DateTime @default(now()) @map("changed_at")
+
+  @@map("AuditLog")
+  @@index([tableName])
+  @@index([changedAt])
+  @@index([changedBy])
+}

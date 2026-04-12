@@ -4,60 +4,80 @@ FROM node:20-alpine AS base
 
 # Install dependencies only when needed
 FROM base AS deps
-# Check https://github.com/nodejs/docker-node/tree/b4117f9333da4138b03a546ec926ef50a31506c3#nodealpine to understand why libc6-compat might be needed.
 RUN apk add --no-cache libc6-compat
 WORKDIR /app
 
-# Install dependencies based on the preferred package manager
+# Cache package dependencies layer
 COPY package.json package-lock.json* ./
 RUN npm ci
 
-# Rebuild the source code only when needed
+# Build stage
 FROM base AS builder
 WORKDIR /app
-COPY --from=deps /app/node_modules ./node_modules
+
+# Copy dependencies
+COPY package.json package-lock.json* ./
+# Install all dependencies (including dev) for building
+RUN npm ci
+
+# Copy source code
 COPY . .
 
 # Generate Prisma Client
 RUN npx prisma generate
 
-# Next.js telemetry is disabled
+# Disable Next.js telemetry
 ENV NEXT_TELEMETRY_DISABLED=1
 
-# Build the Next.js app
+# Build Next.js app
 RUN npm run build
 
-# Production image, copy all the files and run next
+# Production image
 FROM base AS runner
 WORKDIR /app
 
+# Security: Set production environment
 ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
 
-RUN addgroup --system --gid 1001 nodejs
-RUN adduser --system --uid 1001 nextjs
+# Security: Create non-root user with explicit UID/GID
+# Using explicit numeric IDs ensures consistency across deployments
+RUN addgroup --system --gid 1001 nodejs && \
+    adduser --system --uid 1001 nextjs
 
-# Set the correct permission for prerender cache
-RUN mkdir .next
-RUN chown nextjs:nodejs .next
-
-# Automatically leverage output traces to reduce image size
-# https://nextjs.org/docs/advanced-features/output-file-tracing
-COPY --from=builder /app/public ./public
+# Copy built application from builder stage
+# --chown ensures new user owns files (prevents privilege escalation)
 COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
 COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
+COPY --from=builder --chown=nextjs:nodejs /app/public ./public
 
-# We also need the generated prisma client / engines
-COPY --from=builder /app/node_modules/.prisma ./node_modules/.prisma
-COPY --from=builder /app/node_modules/@prisma ./node_modules/@prisma
+# Copy minimal required dependencies
+# We only need Prisma engines and client, not entire node_modules
+COPY --from=builder --chown=nextjs:nodejs /app/node_modules/.prisma ./node_modules/.prisma
+COPY --from=builder --chown=nextjs:nodejs /app/node_modules/@prisma ./node_modules/@prisma
 
-USER nextjs
+# Copy production dependencies
+COPY --from=builder --chown=nextjs:nodejs /app/node_modules ./node_modules
 
+# Create .next directory if it doesn't exist
+RUN mkdir -p .next && chown -R nextjs:nodejs .next
+
+# Expose port
 EXPOSE 3000
 
+# Set hostname to ensure binding to 0.0.0.0 (listen on all interfaces)
 ENV PORT=3000
-# set hostname to localhost
 ENV HOSTNAME="0.0.0.0"
 
-# server.js is created by next build from the standalone output
+# Security: Run as non-root user (UID 1001:GID 1001)
+# If container is compromised, attacker cannot gain root privileges
+USER 1001:1001
+
+# Healthcheck to ensure container is healthy
+# This helps orchestration systems detect failed containers
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+  CMD node -e "require('http').get('http://localhost:3000', (r) => {if (r.statusCode !== 200) throw new Error(r.statusCode)})"
+
+# Run application
+# Use exec form (array) instead of shell form for proper signal handling
 CMD ["node", "server.js"]

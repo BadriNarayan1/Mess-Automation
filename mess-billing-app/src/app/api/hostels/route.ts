@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
+import { isValidName } from '@/lib/security';
 
 // GET /api/hostels — list all hostels
 export async function GET(request: Request) {
@@ -16,7 +17,7 @@ export async function GET(request: Request) {
 export async function POST(request: Request) {
     try {
         const { name } = await request.json();
-        if (!name?.trim()) return NextResponse.json({ error: 'name is required' }, { status: 400 });
+        if (!isValidName(name)) return NextResponse.json({ error: 'A valid hostel name is required (max 200 chars)' }, { status: 400 });
         const hostel = await prisma.hostel.upsert({
             where: { name: name.trim() },
             update: {},

@@ -5,20 +5,28 @@ import * as XLSX from 'xlsx';
 const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June',
     'July', 'August', 'September', 'October', 'November', 'December'];
 
-function daysInMonth(month: number, year: number): number {
-    return new Date(year, month, 0).getDate();
+interface BillingRow {
+    student_id: number;
+    month: number;
+    year: number;
+    days_in_month: number;
+    rebate_days: number;
+    chargeable_days: number;
+    daily_rate: number;
+    gst_percentage: number;
+    amount: number;
 }
 
-function getYearForMonth(month: number, startYear: number, semester: string): number {
-    if (semester === 'I') return month >= 7 ? startYear : startYear + 1;
-    return month <= 6 ? startYear : startYear - 1;
+interface SessionMonth {
+    month: number;
+    year: number;
 }
 
 export async function GET(request: Request) {
     try {
         const { searchParams } = new URL(request.url);
         const sessionId = searchParams.get('sessionId');
-        const monthParam = searchParams.get('month'); // number 1-12 or "all"
+        const monthParam = searchParams.get('month');
         const yearParam = searchParams.get('year');
         const colsParam = searchParams.get('cols');
         const allowedCols = colsParam ? new Set(colsParam.split(',')) : null;
@@ -34,63 +42,51 @@ export async function GET(request: Request) {
 
         const session = await prisma.session.findUnique({ where: { id: sessionIdNum } });
 
+        // Get billing data from stored function
+        const billingData = await prisma.$queryRaw<BillingRow[]>`
+            SELECT * FROM calculate_session_billing(${sessionIdNum}::int)
+        `;
+
+        // Get distinct months
+        let months: SessionMonth[];
+        if (isAllMonths) {
+            const allMonths = await prisma.$queryRaw<SessionMonth[]>`
+                SELECT * FROM get_session_months(${sessionIdNum}::int)
+            `;
+            months = allMonths.map(m => ({ month: Number(m.month), year: Number(m.year) }));
+        } else {
+            const y = session
+                ? (session.semester === 'I'
+                    ? (singleMonth! >= 7 ? session.startYear : session.startYear + 1)
+                    : (singleMonth! <= 6 ? session.startYear : session.startYear - 1))
+                : year;
+            months = [{ month: singleMonth!, year: y }];
+        }
+
+        // Index billing by student_id
+        const billingMap = new Map<number, BillingRow[]>();
+        for (const row of billingData) {
+            const sid = Number(row.student_id);
+            if (!billingMap.has(sid)) billingMap.set(sid, []);
+            billingMap.get(sid)!.push(row);
+        }
+
+        // Fetch assignments with student data
         const assignments = await prisma.studentMessAssignment.findMany({
             where: { sessionId: sessionIdNum },
             include: {
                 student: {
                     include: {
                         course: true,
-                        monthlyRebates: {
-                            where: {
-                                sessionId: sessionIdNum,
-                                ...(isAllMonths ? {} : { month: singleMonth!, year }),
-                            },
-                        },
-                        feesDeposited: {
-                            where: { sessionId: sessionIdNum },
-                        },
-                        refunds: {
-                            where: { sessionId: sessionIdNum },
-                        },
-                        leftRecords: {
-                            where: { sessionId: sessionIdNum },
-                        },
+                        feesDeposited: { where: { sessionId: sessionIdNum } },
+                        refunds: { where: { sessionId: sessionIdNum } },
+                        leftRecords: { where: { sessionId: sessionIdNum } },
                     },
                 },
                 mess: true,
                 session: true,
             },
         });
-
-        const messRates = await prisma.messRate.findMany({
-            where: { sessionId: sessionIdNum },
-        });
-
-        // Determine months to show
-        let months: { month: number; year: number }[];
-        if (isAllMonths) {
-            const distinctRebates = await prisma.monthlyRebate.findMany({
-                where: { sessionId: sessionIdNum },
-                distinct: ['month', 'year'],
-                select: { month: true, year: true },
-            });
-            const monthsSet = new Set<string>();
-            distinctRebates.forEach(r => monthsSet.add(`${r.month}-${r.year}`));
-            messRates.forEach(mr => {
-                const y = session ? getYearForMonth(mr.month, session.startYear, session.semester) : new Date().getFullYear();
-                monthsSet.add(`${mr.month}-${y}`);
-            });
-            months = Array.from(monthsSet).map(s => {
-                const [m, y] = s.split('-');
-                return { month: Number(m), year: Number(y) };
-            }).sort((a, b) => {
-                if (a.year !== b.year) return a.year - b.year;
-                return a.month - b.month;
-            });
-        } else {
-            const y = session ? getYearForMonth(singleMonth!, session.startYear, session.semester) : year;
-            months = [{ month: singleMonth!, year: y }];
-        }
 
         // Group by mess
         const messGrouping: Record<string, { totalAmount: number; students: any[] }> = {};
@@ -107,37 +103,12 @@ export async function GET(request: Request) {
             let totalAmount = 0;
 
             const monthBreakdown: any = {};
+            const studentBilling = billingMap.get(student.id) ?? [];
+
             for (const { month, year: y } of months) {
-                let days = daysInMonth(month, y);
-                const rebate = student.monthlyRebates.find((r) => r.month === month && r.year === y);
-                let rebateDays = rebate?.rebateDays ?? 0;
-
-                const leftRecord = student.leftRecords?.[0];
-                if (leftRecord) {
-                    const lDate = new Date(leftRecord.leaveDate);
-                    const lMonth = lDate.getMonth() + 1;
-                    const lYear = lDate.getFullYear();
-
-                    if (y > lYear || (y === lYear && month > lMonth)) {
-                        days = 0;
-                        rebateDays = 0;
-                    } else if (y === lYear && month === lMonth) {
-                        days = lDate.getDate();
-                    }
-                }
-
-                const chargeableDays = Math.max(0, days - rebateDays);
-
-                const rate = messRates.find(
-                    (mr) =>
-                        mr.messId === a.messId &&
-                        mr.sessionId === sessionIdNum &&
-                        mr.month === month
-                );
-
-                const dailyRate = rate?.monthlyRate ?? 0;
-                const gst = rate?.gstPercentage ?? 0;
-                const amount = chargeableDays * dailyRate * (1 + gst / 100);
+                const bill = studentBilling.find(b => Number(b.month) === month && Number(b.year) === y);
+                const rebateDays = bill ? Number(bill.rebate_days) : 0;
+                const amount = bill ? Number(bill.amount) : 0;
                 totalAmount += amount;
 
                 const label = `${MONTH_NAMES[month - 1].substring(0, 3)} ${y}`;

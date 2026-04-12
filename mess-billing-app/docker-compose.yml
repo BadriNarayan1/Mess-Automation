@@ -6,15 +6,15 @@ services:
     container_name: mess_billing_db
     restart: always
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
-      POSTGRES_DB: ${POSTGRES_DB:-mess_billing}
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER must be set}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB must be set}
     ports:
-      - '5432:5432'
+      - '127.0.0.1:5432:5432'
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-mess_billing}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:?POSTGRES_USER must be set} -d ${POSTGRES_DB:?POSTGRES_DB must be set}"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -27,15 +27,23 @@ services:
     restart: always
     ports:
       - '3000:3000'
+    security_opt:
+      - no-new-privileges:true
     environment:
-      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-password}@db:5432/${POSTGRES_DB:-mess_billing}?schema=public
-      - NEXTAUTH_URL=${NEXTAUTH_URL:-http://localhost:3000}
-      - NEXTAUTH_SECRET=${NEXTAUTH_SECRET:-supersecret_development_key_change_in_production}
-      - AUTH_SECRET=${AUTH_SECRET:-supersecret_development_key_change_in_production}
+      - DATABASE_URL=postgresql://${POSTGRES_USER:?POSTGRES_USER must be set}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@db:5432/${POSTGRES_DB:?POSTGRES_DB must be set}?schema=public
+      - NEXTAUTH_URL=${NEXTAUTH_URL:?NEXTAUTH_URL must be set}
+      - NEXTAUTH_SECRET=${NEXTAUTH_SECRET:?NEXTAUTH_SECRET must be set}
+      - AUTH_SECRET=${AUTH_SECRET:?AUTH_SECRET must be set}
       - AUTH_TRUST_HOST=true
-      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-dummy_google_client_id}
-      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-dummy_google_client_secret}
-      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin}
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:?GOOGLE_CLIENT_ID must be set}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:?GOOGLE_CLIENT_SECRET must be set}
+      - ADMIN_PASSWORD_HASH=${ADMIN_PASSWORD_HASH:?ADMIN_PASSWORD_HASH must be set}
+      - ADMIN_EMAIL=${ADMIN_EMAIL:?ADMIN_EMAIL must be set}
+      - SMTP_HOST=${SMTP_HOST:?SMTP_HOST must be set}
+      - SMTP_PORT=${SMTP_PORT:?SMTP_PORT must be set}
+      - SMTP_USER=${SMTP_USER:?SMTP_USER must be set}
+      - SMTP_PASS=${SMTP_PASS:?SMTP_PASS must be set}
+      - SMTP_FROM=${SMTP_FROM:?SMTP_FROM must be set}
     depends_on:
       db:
         condition: service_healthy

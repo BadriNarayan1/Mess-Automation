@@ -1,26 +1,27 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import * as XLSX from 'xlsx';
+import { MAX_UPLOAD_SIZE, isValidExcelFile } from '@/lib/security';
+import { getClientIp, uploadLimiter } from '@/lib/rate-limit';
 
 // POST /api/upload-mess-assignments
 // Excel columns: EntryNo, MessName, SessionName
 export async function POST(request: Request) {
     try {
+        const rateLimitResult = uploadLimiter.check(getClientIp(request));
+        if (!rateLimitResult.allowed) {
+            return NextResponse.json({ error: 'Too many upload requests. Please try again later.' }, { status: 429 });
+        }
+
         const formData = await request.formData();
         const file = formData.get('file') as File;
         if (!file) return NextResponse.json({ error: 'No file uploaded' }, { status: 400 });
+        if (file.size > MAX_UPLOAD_SIZE) return NextResponse.json({ error: 'File too large. Maximum size is 10MB.' }, { status: 400 });
+        if (!isValidExcelFile(file)) return NextResponse.json({ error: 'Invalid file type. Only Excel files (.xlsx, .xls) are allowed.' }, { status: 400 });
 
         const buffer = new Uint8Array(await file.arrayBuffer());
         const workbook = XLSX.read(buffer, { type: 'array' });
         const jsonData = XLSX.utils.sheet_to_json(workbook.Sheets[workbook.SheetNames[0]]) as any[];
-
-        // Pre-fetch lookup maps
-        const [allSessions, allMesses] = await Promise.all([
-            prisma.session.findMany(),
-            prisma.mess.findMany(),
-        ]);
-        const sessionMap = new Map(allSessions.map(s => [s.name.toLowerCase(), s.id]));
-        const messMap = new Map(allMesses.map(m => [m.name.toLowerCase(), m.id]));
 
         let success = 0;
         const errors: string[] = [];
@@ -35,31 +36,17 @@ export async function POST(request: Request) {
                 continue;
             }
 
-            let messId = messMap.get(messName.toLowerCase());
-            const sessionId = sessionMap.get(sessionName.toLowerCase());
+            // Single DB call via stored procedure
+            const result = await prisma.$queryRaw<[{ bulk_assign_mess: string }]>`
+                SELECT bulk_assign_mess(${entryNo}, ${messName}, ${sessionName})
+            `;
 
-            if (!sessionId) { errors.push(`Session not found: ${sessionName}`); continue; }
-
-            // Create mess if it doesn't exist
-            if (!messId) {
-                const newMess = await prisma.mess.upsert({
-                    where: { name: messName },
-                    update: {},
-                    create: { name: messName },
-                });
-                messId = newMess.id;
-                messMap.set(messName.toLowerCase(), messId);
+            const msg = result[0]?.bulk_assign_mess;
+            if (msg === 'ok') {
+                success++;
+            } else {
+                errors.push(msg ?? `Unknown error for ${entryNo}`);
             }
-
-            const student = await prisma.student.findUnique({ where: { entryNo } });
-            if (!student) { errors.push(`Student not found: ${entryNo}`); continue; }
-
-            await prisma.studentMessAssignment.upsert({
-                where: { studentId_sessionId: { studentId: student.id, sessionId } },
-                update: { messId },
-                create: { studentId: student.id, messId, sessionId },
-            });
-            success++;
         }
 
         return NextResponse.json({ message: `Processed ${success} assignments`, errors }, { status: 200 });

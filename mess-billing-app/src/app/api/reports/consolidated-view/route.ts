@@ -3,13 +3,21 @@ import { prisma } from '@/lib/prisma';
 
 const MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
-function daysInMonth(month: number, year: number): number {
-    return new Date(year, month, 0).getDate();
+interface BillingRow {
+    student_id: number;
+    month: number;
+    year: number;
+    days_in_month: number;
+    rebate_days: number;
+    chargeable_days: number;
+    daily_rate: number;
+    gst_percentage: number;
+    amount: number;
 }
 
-function getYearForMonth(month: number, startYear: number, semester: string): number {
-    if (semester === 'I') return month >= 7 ? startYear : startYear + 1;
-    return month <= 6 ? startYear : startYear - 1;
+interface SessionMonth {
+    month: number;
+    year: number;
 }
 
 export async function GET(request: Request) {
@@ -26,32 +34,25 @@ export async function GET(request: Request) {
         const sessionIdNum = Number(sessionId);
         const session = await prisma.session.findUnique({ where: { id: sessionIdNum } });
 
-        const messRates = await prisma.messRate.findMany({
-            where: { sessionId: sessionIdNum },
-        });
+        // Get distinct months from stored function
+        const distinctMonths = await prisma.$queryRaw<SessionMonth[]>`
+            SELECT * FROM get_session_months(${sessionIdNum}::int)
+        `;
 
-        // Compute distinct months from both rebates and mess rates
-        const distinctRebates = await prisma.monthlyRebate.findMany({
-            where: { sessionId: sessionIdNum },
-            distinct: ['month', 'year'],
-            select: { month: true, year: true },
-        });
+        // Get all billing data in ONE call
+        const billingData = await prisma.$queryRaw<BillingRow[]>`
+            SELECT * FROM calculate_session_billing(${sessionIdNum}::int)
+        `;
 
-        const monthsSet = new Set<string>();
-        distinctRebates.forEach(r => monthsSet.add(`${r.month}-${r.year}`));
-        messRates.forEach(mr => {
-            const year = session ? getYearForMonth(mr.month, session.startYear, session.semester) : new Date().getFullYear();
-            monthsSet.add(`${mr.month}-${year}`);
-        });
+        // Index billing data by student_id
+        const billingMap = new Map<number, BillingRow[]>();
+        for (const row of billingData) {
+            const sid = Number(row.student_id);
+            if (!billingMap.has(sid)) billingMap.set(sid, []);
+            billingMap.get(sid)!.push(row);
+        }
 
-        const distinctMonths = Array.from(monthsSet).map(s => {
-            const [m, y] = s.split('-');
-            return { month: Number(m), year: Number(y) };
-        }).sort((a, b) => {
-            if (a.year !== b.year) return a.year - b.year;
-            return a.month - b.month;
-        });
-
+        // Fetch student metadata
         const students = await prisma.student.findMany({
             include: {
                 course: true,
@@ -59,9 +60,6 @@ export async function GET(request: Request) {
                 messAssignments: {
                     where: { sessionId: sessionIdNum },
                     include: { mess: true },
-                },
-                monthlyRebates: {
-                    where: { sessionId: sessionIdNum },
                 },
                 feesDeposited: {
                     where: { sessionId: sessionIdNum },
@@ -75,8 +73,6 @@ export async function GET(request: Request) {
             },
             orderBy: { entryNo: 'asc' },
         });
-
-
 
         const data = students.map((student) => {
             const assignment = student.messAssignments[0];
@@ -109,42 +105,17 @@ export async function GET(request: Request) {
             if (!allowedCols || allowedCols.has('IFSC')) row['IFSC'] = student.ifsc ?? '-';
 
             let totalAmount = 0;
+            const studentBilling = billingMap.get(student.id) ?? [];
 
-            // Add dynamic columns per (month, year) pair found in this session
             for (const { month, year } of distinctMonths) {
-                let days = daysInMonth(month, year);
-                const rebate = student.monthlyRebates.find((r) => r.month === month && r.year === year);
-                let rebateDays = rebate?.rebateDays ?? 0;
-
-                const leftRecord = student.leftRecords?.[0];
-                if (leftRecord) {
-                    const lDate = new Date(leftRecord.leaveDate);
-                    const lMonth = lDate.getMonth() + 1;
-                    const lYear = lDate.getFullYear();
-
-                    if (year > lYear || (year === lYear && month > lMonth)) {
-                        days = 0;
-                        rebateDays = 0;
-                    } else if (year === lYear && month === lMonth) {
-                        days = lDate.getDate();
-                    }
-                }
-
-                const chargeableDays = Math.max(0, days - rebateDays);
-
-                const rate = messRates.find(
-                    (mr) =>
-                        mr.messId === assignment?.messId &&
-                        mr.sessionId === sessionIdNum &&
-                        mr.month === month
-                );
-
-                const dailyRate = rate?.monthlyRate ?? 0;
-                const gst = rate?.gstPercentage ?? 0;
-                const amount = chargeableDays * dailyRate * (1 + gst / 100);
+                const m = Number(month);
+                const y = Number(year);
+                const bill = studentBilling.find(b => Number(b.month) === m && Number(b.year) === y);
+                const rebateDays = bill ? Number(bill.rebate_days) : 0;
+                const amount = bill ? Number(bill.amount) : 0;
                 totalAmount += amount;
 
-                const label = `${MONTH_NAMES[month - 1]} ${year}`;
+                const label = `${MONTH_NAMES[m - 1]} ${y}`;
                 if (!allowedCols || allowedCols.has('Rebate Days')) {
                     row[`${label} Rebate Days`] = rebateDays;
                 }
@@ -155,16 +126,16 @@ export async function GET(request: Request) {
             row['Total Fees Deposited (₹)'] = parseFloat(totalFees.toFixed(2));
             row['Total Refunds (₹)'] = parseFloat(totalRefunds.toFixed(2));
             row['Net Balance (₹)'] = parseFloat((totalFees - (totalAmount + totalRefunds)).toFixed(2));
-            
+
             return row;
         });
 
-        // Also return the column list so the UI knows exactly what to render in order
+        // Build column list for the UI
         const baseColumns = ['Entry No', 'Name', 'Course', 'Batch', 'Hostel', 'Mess', 'Mess Security', 'Address', 'Gender', 'Mobile No', 'Name in Bank', 'JoSAA Roll No', 'Department', 'Parent Mobile No', 'Date of Joining', 'Date of Leaving', 'Left Date', 'Bank Account No', 'Bank Name', 'IFSC'];
         const columns = baseColumns.filter(c => !allowedCols || ['Entry No', 'Name'].includes(c) || allowedCols.has(c));
 
         for (const { month, year } of distinctMonths) {
-            const label = `${MONTH_NAMES[month - 1]} ${year}`;
+            const label = `${MONTH_NAMES[Number(month) - 1]} ${Number(year)}`;
             if (!allowedCols || allowedCols.has('Rebate Days')) {
                 columns.push(`${label} Rebate Days`);
             }

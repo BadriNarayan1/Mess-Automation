@@ -12,6 +12,7 @@ const ADMIN_ONLY_API_PREFIXES = [
   "/api/upload-refunds",
   // Admin management
   "/api/admin",
+  "/api/audit-log",
   // Reports
   "/api/reports",
   // Bulk data endpoints (students shouldn't see all records)

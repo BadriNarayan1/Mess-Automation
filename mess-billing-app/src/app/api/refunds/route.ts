@@ -1,5 +1,8 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
+import { auth } from '@/lib/auth';
+import { withAuditUser } from '@/lib/audit';
+import { isPositiveInt, isPositiveNumber, isValidDate } from '@/lib/security';
 
 export async function GET(request: Request) {
     try {
@@ -7,9 +10,15 @@ export async function GET(request: Request) {
         const sessionId = searchParams.get('sessionId');
         const studentId = searchParams.get('studentId');
 
-        const where: any = {};
-        if (sessionId) where.sessionId = Number(sessionId);
-        if (studentId) where.studentId = Number(studentId);
+        const where: Record<string, number> = {};
+        if (sessionId) {
+            if (!isPositiveInt(sessionId)) return NextResponse.json({ error: 'Invalid sessionId' }, { status: 400 });
+            where.sessionId = Number(sessionId);
+        }
+        if (studentId) {
+            if (!isPositiveInt(studentId)) return NextResponse.json({ error: 'Invalid studentId' }, { status: 400 });
+            where.studentId = Number(studentId);
+        }
 
         const refunds = await prisma.refund.findMany({
             where,
@@ -27,34 +36,48 @@ export async function GET(request: Request) {
 
 export async function POST(request: Request) {
     try {
+        const session = await auth();
+        const userId = (session?.user as any)?.id ?? 'unknown';
+
         const { entryNo, sessionId, amount, paymentDate } = await request.json();
         if (!entryNo || !sessionId || amount == null || !paymentDate) {
             return NextResponse.json({ error: 'entryNo, sessionId, amount and paymentDate are required' }, { status: 400 });
         }
+        if (!isPositiveInt(sessionId)) return NextResponse.json({ error: 'Invalid sessionId' }, { status: 400 });
+        if (!isPositiveNumber(amount)) return NextResponse.json({ error: 'Amount must be a positive number' }, { status: 400 });
+        if (!isValidDate(paymentDate)) return NextResponse.json({ error: 'Invalid payment date' }, { status: 400 });
 
-        const student = await prisma.student.findUnique({ where: { entryNo } });
-        if (!student) return NextResponse.json({ error: `Student ${entryNo} not found` }, { status: 404 });
+        const sessionIdNum = Number(sessionId);
+        const amountNum = Number(amount);
+        const paymentDateVal = new Date(paymentDate);
 
-        const refund = await prisma.refund.create({
-            data: {
-                studentId: student.id,
-                sessionId: Number(sessionId),
-                amount: Number(amount),
-                paymentDate: new Date(paymentDate),
-            },
-            include: { student: true, session: true }
+        const result = await withAuditUser(userId, async (tx) => {
+            return tx.$queryRaw<[{ sp_create_refund: number }]>`
+                SELECT sp_create_refund(${entryNo}, ${sessionIdNum}::int, ${amountNum}::double precision, ${paymentDateVal}::timestamp)
+            `;
         });
-        return NextResponse.json(refund, { status: 201 });
-    } catch (error) {
+
+        return NextResponse.json({ id: result[0].sp_create_refund, message: 'Refund recorded' }, { status: 201 });
+    } catch (error: any) {
         console.error(error);
-        return NextResponse.json({ error: 'Failed to record refund' }, { status: 500 });
+        const msg = error?.message?.includes('Student not found') ? error.message : 'Failed to record refund';
+        return NextResponse.json({ error: msg }, { status: error?.message?.includes('Student not found') ? 404 : 500 });
     }
 }
 
 export async function DELETE(request: Request) {
     try {
+        const session = await auth();
+        const userId = (session?.user as any)?.id ?? 'unknown';
+
         const { id } = await request.json();
-        await prisma.refund.delete({ where: { id: Number(id) } });
+        if (!isPositiveInt(id)) return NextResponse.json({ error: 'Invalid id' }, { status: 400 });
+        const idNum = Number(id);
+
+        await withAuditUser(userId, async (tx) => {
+            return tx.$queryRaw`SELECT sp_delete_refund(${idNum}::int)`;
+        });
+
         return NextResponse.json({ message: 'Refund deleted' });
     } catch (error) {
         return NextResponse.json({ error: 'Failed to delete refund' }, { status: 500 });

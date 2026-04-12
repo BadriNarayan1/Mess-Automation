@@ -1,17 +1,26 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { auth } from '@/lib/auth';
+import { isPositiveInt } from '@/lib/security';
 
 const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June',
     'July', 'August', 'September', 'October', 'November', 'December'];
 
-function daysInMonth(month: number, year: number): number {
-    return new Date(year, month, 0).getDate();
-}
-
-function getYearForMonth(month: number, startYear: number, semester: string): number {
-    if (semester === 'I') return month >= 7 ? startYear : startYear + 1;
-    return month <= 6 ? startYear : startYear - 1;
+interface BillRow {
+    mess_name: string;
+    session_name: string;
+    month: number;
+    year: number;
+    days_in_month: number;
+    rebate_days: number;
+    chargeable_days: number;
+    daily_rate: number;
+    gst_percentage: number;
+    amount: number;
+    total_amount: number;
+    total_fees_deposited: number;
+    total_refunds: number;
+    net_balance: number;
 }
 
 export async function GET(request: Request) {
@@ -23,6 +32,8 @@ export async function GET(request: Request) {
         if (!studentId || !sessionId) {
             return NextResponse.json({ error: 'studentId and sessionId are required' }, { status: 400 });
         }
+        if (!isPositiveInt(Number(studentId))) return NextResponse.json({ error: 'Invalid studentId' }, { status: 400 });
+        if (!isPositiveInt(Number(sessionId))) return NextResponse.json({ error: 'Invalid sessionId' }, { status: 400 });
 
         const session = await auth();
         const userRole = (session?.user as any)?.role;
@@ -36,82 +47,36 @@ export async function GET(request: Request) {
         const studentIdNum = Number(studentId);
         const sessionIdNum = Number(sessionId);
 
-        const sessionRecord = await prisma.session.findUnique({ where: { id: sessionIdNum } });
-        if (!sessionRecord) {
-            return NextResponse.json({ error: 'Session not found' }, { status: 404 });
+        // Call the stored function instead of computing in TypeScript
+        const rows = await prisma.$queryRaw<BillRow[]>`
+            SELECT * FROM get_student_bill_summary(${studentIdNum}::int, ${sessionIdNum}::int)
+        `;
+
+        if (!rows || rows.length === 0) {
+            return NextResponse.json({
+                messName: 'Not Assigned',
+                sessionName: '',
+                bills: [],
+                totalAmount: 0,
+            });
         }
 
-        const assignment = await prisma.studentMessAssignment.findFirst({
-            where: { studentId: studentIdNum, sessionId: sessionIdNum },
-            include: { mess: true },
-        });
-
-        const messRates = await prisma.messRate.findMany({
-            where: { sessionId: sessionIdNum, ...(assignment ? { messId: assignment.messId } : {}) },
-        });
-
-        const rebates = await prisma.monthlyRebate.findMany({
-            where: { studentId: studentIdNum, sessionId: sessionIdNum },
-            orderBy: [{ year: 'asc' }, { month: 'asc' }],
-        });
-
-        const leftRecord = await prisma.studentLeft.findFirst({
-            where: { studentId: studentIdNum, sessionId: sessionIdNum },
-        });
-
-        // Compute distinct months from mess rates
-        const monthsSet = new Set<string>();
-        messRates.forEach(mr => {
-            const year = getYearForMonth(mr.month, sessionRecord.startYear, sessionRecord.semester);
-            monthsSet.add(`${mr.month}-${year}`);
-        });
-        rebates.forEach(r => monthsSet.add(`${r.month}-${r.year}`));
-
-        const months = Array.from(monthsSet).map(s => {
-            const [m, y] = s.split('-');
-            return { month: Number(m), year: Number(y) };
-        }).sort((a, b) => a.year !== b.year ? a.year - b.year : a.month - b.month);
-
-        const bills = months.map(({ month, year }) => {
-            let days = daysInMonth(month, year);
-            const rebate = rebates.find(r => r.month === month && r.year === year);
-            let rebateDays = rebate?.rebateDays ?? 0;
-
-            if (leftRecord) {
-                const lDate = new Date(leftRecord.leaveDate);
-                const lMonth = lDate.getMonth() + 1;
-                const lYear = lDate.getFullYear();
-                if (year > lYear || (year === lYear && month > lMonth)) {
-                    days = 0;
-                    rebateDays = 0;
-                } else if (year === lYear && month === lMonth) {
-                    days = lDate.getDate();
-                }
-            }
-
-            const chargeableDays = Math.max(0, days - rebateDays);
-            const rate = messRates.find(mr => mr.month === month);
-            const dailyRate = rate?.monthlyRate ?? 0;
-            const gst = rate?.gstPercentage ?? 0;
-            const amount = chargeableDays * dailyRate * (1 + gst / 100);
-
-            return {
-                month: MONTH_NAMES[month - 1],
-                year,
-                daysInMonth: days,
-                rebateDays,
-                chargeableDays,
-                dailyRate,
-                gst,
-                amount: parseFloat(amount.toFixed(2)),
-            };
-        });
+        const bills = rows.map(r => ({
+            month: MONTH_NAMES[Number(r.month) - 1],
+            year: Number(r.year),
+            daysInMonth: Number(r.days_in_month),
+            rebateDays: Number(r.rebate_days),
+            chargeableDays: Number(r.chargeable_days),
+            dailyRate: Number(r.daily_rate),
+            gst: Number(r.gst_percentage),
+            amount: parseFloat(Number(r.amount).toFixed(2)),
+        }));
 
         return NextResponse.json({
-            messName: assignment?.mess?.name ?? 'Not Assigned',
-            sessionName: sessionRecord.name,
+            messName: rows[0].mess_name ?? 'Not Assigned',
+            sessionName: rows[0].session_name,
             bills,
-            totalAmount: parseFloat(bills.reduce((s, b) => s + b.amount, 0).toFixed(2)),
+            totalAmount: parseFloat(Number(rows[0].total_amount).toFixed(2)),
         });
     } catch (error) {
         console.error('Student billing error:', error);
